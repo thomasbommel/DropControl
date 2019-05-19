@@ -1,49 +1,51 @@
-#include <Arduino.h>
 // ======== LIBRARIES =======
-#include<stdlib.h>
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
 #include <SD.h>
 #include <SPI.h>
-#include <TinyGPS++.h>
 #include <SoftwareSerial.h>
-#include <LiquidCrystal_I2C.h> 
- 
+#include <TinyGPS++.h>
+#include <stdlib.h>
+
+
 // ======= DEVICE CONFIG ========
-#define DEVICE_NAME         "FMP"
+#define DEVICE_NAME "FML"
 #define MIN_TIME_BETWEEN_INTERRUPTS 500
 
 // ========= PIN DEFINE  ========
-#define SD_CHIPSELECT_PIN       15
-#define SPEED_PIN               A7
-#define TELTONIKA_PIN           A6
-#define INTERRUPT_PIN           A17
-#define INCREASE_DISTANCE_PIN   A9
-#define DECREASE_DISTANCE_PIN   A8
-#define ADJUSTMENT_PIN          A0
-#define LED_PIN                 2
-
+#define SD_EXTERNAL_CHIPSELECT_PIN 15
+#define SD_INTERNAL_CHIPSELECT_PIN BUILTIN_SDCARD
+#define SPEED_PIN A7
+#define TELTONIKA_PIN A6
+#define INTERRUPT_PIN A17
+#define INCREASE_DISTANCE_PIN A9
+#define DECREASE_DISTANCE_PIN A8
+#define ADJUSTMENT_PIN A0
+#define LED_PIN 2
+ 
 // ========= OBJECTS ============
 TinyGPSPlus gps;
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 // ========= CONSTANTS ===========
 #define EARTH_RADIUS_METERS 6372795.0
-#define GPS_SERIAL          Serial3
-#define GPS_BAUDRATE        9600
-#define AREA_COUNT          5000
+#define GPS_SERIAL Serial3
+#define GPS_BAUDRATE 9600
+#define AREA_COUNT 5000
 
 // ========= VARIABLES ===========
 float AREAS_TO_EXCLUDE[AREA_COUNT][4];
 long areas_to_excluce_count = 0;
 File excludeFile;
 unsigned long previousMillis = 0;
-const long excludeCheckInterval = 1000;
+const long excludeCheckInterval = 500;
 
 volatile boolean baitWasDropped = false;
 long dropCount = 0;
 double distanceBetweenDrops = 50.0;
 int currentSpeed = 200; // 0-255
 double ms = 10;
-char currentDate[20]; //for filename
+char currentDate[20]; // for filename
 double lastLat = -1;
 double lastLng = -1;
 
@@ -54,30 +56,42 @@ double lastDistanceBetweenDrops = 50;
 
 boolean shouldCheckExclude = true;
 unsigned long lastTeltonikaActivationTime = 0;
+unsigned long lastLCDClearTime = 0;
 
 // ========= SETUP ==============
 void setup() {
   Serial.begin(9600);
   delay(2000);
+  Serial.println(DEVICE_NAME);
   initPins();
   stopMotor();
   initGPS();
   initLCD();
-  initSD();
+  initSD(SD_INTERNAL_CHIPSELECT_PIN);
+  delay(100);
+  initSD(SD_EXTERNAL_CHIPSELECT_PIN);
+  delay(100);
   initAreasToExclude();
   lcd.clear();
 
-  if (digitalRead(INCREASE_DISTANCE_PIN) == LOW &&  digitalRead(DECREASE_DISTANCE_PIN) == LOW) {
+  if (digitalRead(INCREASE_DISTANCE_PIN) == LOW &&
+      digitalRead(DECREASE_DISTANCE_PIN) == LOW) {
     shouldCheckExclude = false;
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print(F("SKIP EXCLUDE"));
     delay(3000);
   }
+
+  log("exclude areas: ", false);
+  log(areas_to_excluce_count, true);
+  for (long i = 0; i < areas_to_excluce_count; i++) {
+    log(AREAS_TO_EXCLUDE[i][0], false);
+    log(AREAS_TO_EXCLUDE[i][1], true);
+  }
 }
 
-void handleInterrupt()
-{
+void handleInterrupt() {
   static long last_interrupt_time = 0;
   long interrupt_time = millis();
   if (interrupt_time - last_interrupt_time > MIN_TIME_BETWEEN_INTERRUPTS) {
@@ -88,23 +102,14 @@ void handleInterrupt()
 
 // ========= LOOP ===============
 void loop() {
+  smartDelay(60);
   if (gps.speed.isValid()) {
-    ms = double( gps.speed.mps());
+    ms = double(gps.speed.mps());
   }
-  smartDelay(30);
-  if (gps.sentencesWithFix() == 0 || !gps.speed.isValid() ||  !gps.location.isValid()) {
-    //searching gps
-    lcd.setCursor(0, 0);
-    lcd.print(F("SEARCHING GPS..."));
-    delay(40);
-    lcd.setCursor(0, 0);
-    lcd.print(F("SEARCHING GPS   "));
-    lcd.setCursor(0, 1);
-    lcd.print("d:");
-    lcd.print(distanceBetweenDrops, 0);
-    lcd.print("  adj:");
-    lcd.print(adjustMentMeters, 1);
-    delay(40);
+
+  if (gps.sentencesWithFix() == 0 || !gps.speed.isValid() ||
+      !gps.location.isValid()) {
+    printSearchGpsToLCD();
   } else if (baitWasDropped) {
     if (first) {
       first = false;
@@ -115,17 +120,23 @@ void loop() {
     baitWasDropped = false;
     dropCount = dropCount + 1;
     adjustSpeed();
+
+    initExternalSD();
     savePoint();
-    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), handleInterrupt, FALLING);
+    initInternalSD();
+    savePoint();
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), handleInterrupt,
+                    FALLING);
   } else {
     printStatsToLCD();
   }
 
-  //adjustMentMeters = (map(analogRead(ADJUSTMENT_PIN), 0, 1023, -100, 100) / 10.0);
+  // adjustMentMeters = (map(analogRead(ADJUSTMENT_PIN), 0, 1023, -100, 100)
+  // / 10.0);
 
   unsigned long currentMillis = millis();
 
-  if ( (currentMillis - lastTeltonikaActivationTime) <= 300) {
+  if ((currentMillis - lastTeltonikaActivationTime) <= 300) {
     digitalWrite(TELTONIKA_PIN, HIGH);
   } else {
     digitalWrite(TELTONIKA_PIN, LOW);
@@ -136,7 +147,12 @@ void loop() {
     checkForExclude();
   }
 
-  if (ms > 8 && gps.location.isValid()) {
+  if (currentMillis - lastLCDClearTime >= 20000) {
+    lastLCDClearTime = currentMillis;
+    lcd.clear();
+  }
+
+  if (ms > 3 && gps.location.isValid()) {
     analogWrite(SPEED_PIN, currentSpeed);
   } else {
     analogWrite(SPEED_PIN, 0);
@@ -145,24 +161,61 @@ void loop() {
   increaseOrDecreaseDistanceIfButtonPressed();
 }
 
+void printSearchGpsToLCD() {
+  // searching gps
+  lcd.setCursor(0, 0);
+  lcd.print(F("SEARCHING GPS..."));
+  lcd.setCursor(0, 0);
+  lcd.print(F("SEARCHING GPS   "));
+  lcd.setCursor(0, 1);
+  lcd.print("d:");
+  lcd.print(distanceBetweenDrops, 0);
+  lcd.print("  adj:");
+  lcd.print(adjustMentMeters, 1);
+  Serial.print("searching gps...");
+  Serial.print(" speed ");
+  Serial.print(gps.speed.isValid());
+  Serial.print(" location ");
+  Serial.print(gps.location.isValid());
+  Serial.print(" sentencesWithFix ");
+  Serial.println(gps.sentencesWithFix());
+  smartDelay(40);
+}
+
 void checkForExclude() {
   if (shouldCheckExclude) {
+    log("checkForExclude: ", true);
     float point[] = {(float)gps.location.lat(), (float)gps.location.lng()};
+
+    log(point[0], false);
+    log(point[1], true);
+
     boolean shouldExcludeThisPoint = shouldExcludePoint(point);
 
+    Serial.print(point[0], 8);
+    Serial.print(" ");
+    Serial.println(point[1], 8);
     while (shouldExcludeThisPoint) {
+      log(" point should be excluded ", false);
+      Serial.println(" point should be excluded");
       analogWrite(SPEED_PIN, 0);
       point[0] = (float)gps.location.lat();
       point[1] = (float)gps.location.lng();
+
+      log(point[0], false);
+      log(point[1], true);
+
       shouldExcludeThisPoint = shouldExcludePoint(point);
-      smartDelay(50);
+      smartDelay(100);
       digitalWrite(LED_PIN, HIGH);
     }
+    // Serial.println("point not excluded");
     digitalWrite(LED_PIN, LOW);
   }
 }
 
 void initAreasToExclude() {
+  initExternalSD();
   excludeFile = SD.open("exclude.txt");
   if (excludeFile) {
     String line = "";
@@ -171,7 +224,7 @@ void initAreasToExclude() {
       if (c != '\n') {
         line += c;
       } else {
-        computeArea( areas_to_excluce_count, line);
+        computeArea(areas_to_excluce_count, line);
         areas_to_excluce_count++;
         line = "";
       }
@@ -238,10 +291,12 @@ boolean isContainedInArea(float point[2], float area[4]) {
   float areaNwLng = area[1];
   float areaSeLat = area[2];
   float areaSeLng = area[3];
-  return (pointLat < areaNwLat && pointLat > areaSeLat  && pointLng > areaNwLng && pointLng < areaSeLng);
+  return (pointLat < areaNwLat && pointLat > areaSeLat &&
+          pointLng > areaNwLng && pointLng < areaSeLng);
 }
 
 void printStatsToLCD() {
+  /*
   Serial.print(F("dropCount: "));
   Serial.println(dropCount);
   Serial.print(F(", currentSpeed: "));
@@ -250,7 +305,7 @@ void printStatsToLCD() {
   Serial.print(distanceBetweenDrops);
   Serial.print(F(", ms: "));
   Serial.println(ms);
-
+*/
   lcd.setCursor(0, 0);
   lcd.print("# ");
   lcd.print(dropCount);
@@ -262,28 +317,35 @@ void printStatsToLCD() {
 
   lcd.setCursor(0, 1);
   lcd.print(distanceBetweenDrops, 0);
-  lcd.print(" ");
+  lcd.print("_");
 
   lcd.setCursor(5, 1);
   lcd.print(lastDistanceBetweenDrops, 0);
-  lcd.print(" ");
+  lcd.print("_");
 
   lcd.setCursor(9, 1);
   lcd.print(map(currentSpeed, 0, 255, 0, 100));
-  lcd.print(" ");
+  lcd.print("_");
 }
 
 void adjustSpeed() {
   double latitude = gps.location.lat();
   double longitude = gps.location.lng();
-  double distance = TinyGPSPlus::distanceBetween(lastLat, lastLng, latitude, longitude);
-
+  double distance =
+      TinyGPSPlus::distanceBetween(lastLat, lastLng, latitude, longitude);
+  log("calculated distance between: ", false);
+  log(distance, true);
   handleDifference(distanceBetweenDrops, distance);
   lastLat = latitude;
   lastLng = longitude;
 }
 
 void handleDifference(double wanted, double actual) {
+  log("handleDifference, wanted: ", false);
+  log(wanted, false);
+  log(" actual: ", false);
+  log(actual, true);
+
   wanted = wanted + adjustMentMeters;
 
   lastDistanceBetweenDrops = actual;
@@ -296,7 +358,7 @@ void handleDifference(double wanted, double actual) {
     factor = -2.0; // slow down
   }
   int changeAmount = 1;
-  changeAmount = abs(round(( (currentSpeed + 40) / 150.0) * difference));
+  changeAmount = abs(round(((currentSpeed + 40) / 150.0) * difference));
 
   changeAmount = constrain(changeAmount, 1, 30);
   changeAmount *= factor;
@@ -306,12 +368,18 @@ void handleDifference(double wanted, double actual) {
   Serial.print(F(", changeAmount: "));
   Serial.println(changeAmount);
   currentSpeed += changeAmount;
+  log("changeAmount: ", true);
+  log(changeAmount, false);
+
+  log("speed ", true);
+  log(ms, true);
 
   currentSpeed = constrain(currentSpeed, 70, 255);
 }
 
 void increaseOrDecreaseDistanceIfButtonPressed() {
-  if (digitalRead(INCREASE_DISTANCE_PIN) == LOW && distanceBetweenDrops <= 500) {
+  if (digitalRead(INCREASE_DISTANCE_PIN) == LOW &&
+      distanceBetweenDrops <= 500) {
     // increase the distance between the drops by 1m
     distanceBetweenDrops += 1.0;
 
@@ -342,9 +410,9 @@ void initPins() {
   blinkLed();
   digitalWrite(LED_PIN, LOW);
 
-
   pinMode(INTERRUPT_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), handleInterrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), handleInterrupt,
+                  FALLING);
   pinMode(ADJUSTMENT_PIN, INPUT);
 }
 
@@ -370,9 +438,7 @@ void blinkLed() {
   digitalWrite(LED_PIN, LOW);
 }
 
-void stopMotor() {
-  analogWrite(SPEED_PIN, 0);
-}
+void stopMotor() { analogWrite(SPEED_PIN, 0); }
 
 void initGPS() {
   GPS_SERIAL.begin(GPS_BAUDRATE);
@@ -383,8 +449,11 @@ void initGPS() {
   delay(1000);
   GPS_SERIAL.begin(57600);
   delay(500);
-  //GPS_SERIAL.println("$PMTK314,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*29"); //only get some sentences
-  GPS_SERIAL.println("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28"); //only get some sentences
+  // GPS_SERIAL.println("$PMTK314,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*29");
+  // //only get some sentences
+  GPS_SERIAL.println(
+      "$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28"); // only get some
+                                                            // sentences
   delay(1000);
   GPS_SERIAL.println("$PMTK220,100*2F"); // set update Rate to 10Hz
   delay(1000);
@@ -396,26 +465,39 @@ void initLCD() {
   lcd.backlight();
   lcd.setCursor(0, 0);
   lcd.print(DEVICE_NAME);
-  lcd.print("-006");
+  lcd.print("-007");
   delay(2000);
 }
 
-void initSD() {
-  Serial.print(F("Init. SD card..."));
-  while (!SD.begin(SD_CHIPSELECT_PIN)) {
+void initInternalSD() {
+  SD.end();
+  SD.begin(SD_INTERNAL_CHIPSELECT_PIN);
+}
+
+void initExternalSD() {
+  SD.end();
+  SD.begin(SD_EXTERNAL_CHIPSELECT_PIN);
+}
+
+void initSD(uint8_t pin) {
+  SD.end();
+
+  // Serial.print(F("Init. SD card..."));
+  while (!SD.begin(pin)) {
     Serial.println(F("SD init failed!"));
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("SD ERROR");
-    delay(2000);
+    delay(200);
   }
-  Serial.println(F("SD init done."));
+  // Serial.println(F("SD init done."));
 }
 
 void getFileName() {
-  if (currentDate[0] == NULL) {//DO NOT CHANGE THIS LINE!!!!
-    //Serial.println("getFileName");
-    sprintf(currentDate, "%s_%02d%02d.txt", DEVICE_NAME,  gps.date.month(),  gps.date.day());
+  if (currentDate[0] == NULL) { // DO NOT CHANGE THIS LINE!!!!
+    // Serial.println("getFileName");
+    sprintf(currentDate, "%s_%02d%02d.txt", DEVICE_NAME, gps.date.month(),
+            gps.date.day());
   }
 }
 
@@ -428,22 +510,47 @@ void setNewFileName() {
   if (tries > 99) {
     tries = 99;
   }
-  sprintf(currentDate, "%d_%02d%02d.txt", tries,  gps.date.month(),  gps.date.day());
+  sprintf(currentDate, "%d_%02d%02d.txt", tries, gps.date.month(),
+          gps.date.day());
 }
 
-static void smartDelay(unsigned long milliseconds) {               // This custom version of delay() ensures that the gps object is being "fed".
+static void smartDelay(
+    unsigned long milliseconds) { // This custom version of delay() ensures that
+                                  // the gps object is being "fed".
   unsigned long start = millis();
   do {
     yield();
-    while (!GPS_SERIAL.available()) {}
+    while (!GPS_SERIAL.available()) {
+    }
     while (GPS_SERIAL.available()) {
       gps.encode(GPS_SERIAL.read());
     }
   } while (millis() - start < milliseconds);
 }
 
+void log(String msg, boolean newLine) {
+  if (shouldCheckExclude) {
+    initSD(SD_EXTERNAL_CHIPSELECT_PIN);
+    File logFile = SD.open("log.txt", FILE_WRITE);
+    if (logFile) { // valid file
+      logFile.print(millis());
+      logFile.print(" ");
+      logFile.print(msg);
+      logFile.println(" ");
+    }
+    Serial.print("log: ");
+    Serial.print(millis());
+    Serial.print("  ");
+    Serial.println(msg);
+    logFile.close();
+    SD.end();
+  }
+}
+
 void savePoint() {
-  delay(10);//needed because garbage lines were written to the sd (caused by motor)
+  yield();
+  smartDelay(20); // needed because garbage lines were written to the sd (caused
+                  // by motor)
   getFileName();
   File dataFile = SD.open(currentDate, FILE_WRITE);
   if (dataFile) { // valid file
@@ -465,7 +572,7 @@ void savePoint() {
     dataFile.print(gps.time.second());
     dataFile.print(",");
 
-    //date
+    // date
     if (gps.date.day() < 10) {
       dataFile.print("0");
     }
